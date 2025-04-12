@@ -15,11 +15,10 @@ from .servers.zmqserver import start_zmq_server_as_subprocess
 class ViewerWindow:
     context = zmq.Context()
 
-    def __init__(self, zmq_url, start_server, server_args):
+    def __init__(self, zmq_url, start_server, server_args, http_port=None):
         if start_server:
             self.server_proc, self.zmq_url, self.web_url = start_zmq_server_as_subprocess(
-                zmq_url=zmq_url, server_args=server_args)
-
+                zmq_url=zmq_url, server_args=server_args, http_port=http_port)
         else:
             self.server_proc = None
             self.zmq_url = zmq_url
@@ -87,9 +86,10 @@ def srcdoc_escape(x):
 class Visualizer:
     __slots__ = ["window", "path"]
 
-    def __init__(self, zmq_url=None, window=None, server_args=[]):
+    def __init__(self, zmq_url=None, window=None, server_args=[], http_port=None):
         if window is None:
-            self.window = ViewerWindow(zmq_url=zmq_url, start_server=(zmq_url is None), server_args=server_args)
+            self.window = ViewerWindow(zmq_url=zmq_url, start_server=(zmq_url is None), 
+                                      server_args=server_args, http_port=http_port)
         else:
             self.window = window
         self.path = Path(("meshcat",))

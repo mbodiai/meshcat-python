@@ -34,19 +34,25 @@ def match_zmq_url(line):
 def match_web_url(line):
     return capture(r"^web_url=(.*)$", line)
 
-def start_zmq_server_as_subprocess(zmq_url=None, server_args=[]):
+def start_zmq_server_as_subprocess(zmq_url=None, server_args=[], http_port=None):
     """
     Starts the ZMQ server as a subprocess, passing *args through popen.
     Optional Keyword Arguments:
         zmq_url
+        http_port (int): Explicit HTTP port for the web server
     """
     # Need -u for unbuffered output: https://stackoverflow.com/a/25572491
     args = [sys.executable, "-u", "-m", "meshcat.servers.zmqserver"]
     if zmq_url is not None:
         args.append("--zmq-url")
         args.append(zmq_url)
+    if http_port is not None:
+        args.append("--http-port")
+        args.append(str(http_port))
     if server_args:
-        args.append(*server_args)
+        # Fix the bug with args.append(*server_args)
+        args.extend(server_args)
+        
     # Note: Pass PYTHONPATH to be robust to workflows like Google Colab,
     # where meshcat might have been added directly via sys.path.append.
     # Copy existing environmental variables as some of them might be needed
@@ -162,14 +168,16 @@ class StaticFileHandlerNoCache(tornado.web.StaticFileHandler):
 
 
 class ZMQWebSocketBridge(object):
-    context = zmq.Context()
-
+    
     def __init__(self, zmq_url=None, host="127.0.0.1", port=None,
                  certfile=None, keyfile=None, ngrok_http_tunnel=False):
         self.host = host
         self.websocket_pool = set()
         self.app = self.make_app()
         self.ioloop = tornado.ioloop.IOLoop.current()
+        
+        # Initialize context BEFORE calling setup_zmq
+        self.context = zmq.Context()
 
         if zmq_url is None:
             def f(port):
@@ -393,14 +401,15 @@ def main():
     parser.add_argument('--open', '-o', action="store_true")
     parser.add_argument('--certfile', type=str, default=None)
     parser.add_argument('--keyfile', type=str, default=None)
-    parser.add_argument('--ngrok_http_tunnel', action="store_true", help="""
-ngrok is a service for creating a public URL from your local machine, which
-is very useful if you would like to make your meshcat server public.""")
+    parser.add_argument('--ngrok-http-tunnel', action="store_true", default=False)
+    parser.add_argument('--http-port', type=int, default=None, 
+                        help="Port to use for the HTTP server (default: automatically find an available port)")
     results = parser.parse_args()
     bridge = ZMQWebSocketBridge(zmq_url=results.zmq_url,
                                 certfile=results.certfile,
                                 keyfile=results.keyfile,
-                                ngrok_http_tunnel=results.ngrok_http_tunnel)
+                                ngrok_http_tunnel=results.ngrok_http_tunnel,
+                                port=results.http_port)
     print("zmq_url={:s}".format(bridge.zmq_url))
     print("web_url={:s}".format(bridge.web_url))
     if results.open:

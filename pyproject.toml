@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meshcat-python"
+version = "0.1.0"
+description = "A new workspace"
+authors = [
+    { name="A happy mb user", email="prod@mb.com" }
+]
+license = "MIT"
+
+dependencies = [
+    "fastapi==0.115.12",
+    "websockets==15.0.1",
+    "rich_click==1.8.8",
+    "pydantic==2.11.4",
+    "zmq==0.0.0",
+    "uvicorn==0.34.2",
+    "msgpack_python==0.5.6",
+    "umsgpack==0.1.0",
+    "python_multipart==0.0.20",
+    "starlette==0.46.2",
+    "rtree==1.4.0",
+    "trimesh==4.6.8",
+    "fcl==0.0.12",
+]
+
+[project.optional-dependencies]
+all = [
+    "msgpack_python==0.5.6",
+    "umsgpack==0.1.0",
+    "python_multipart==0.0.20",
+    "starlette==0.46.2",
+    "shellingham==1.5.4",
+    "typer==0.15.3",
+    "rich_toolkit==0.14.5",
+    "fastapi_cli[standard]==0.0.7",
+    "email_validator==2.2.0",
+    "ujson==5.10.0",
+    "orjson==3.10.18",
+    "typing_inspection==0.4.0",
+    "pydantic_core==2.34.1",
+    "pydantic==2.11.4",
+    "rtree==1.4.0",
+    "trimesh==4.6.8",
+    "fcl==0.0.12",
+]

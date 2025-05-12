@@ -1,15 +1,15 @@
 from __future__ import absolute_import, division, print_function
 
-import time
+
 import numpy as np
 
-import meshcat
-import meshcat.geometry as g
 
+from meshcat.geometry import Points, PointsGeometry, PointsMaterial
+from meshcat.visualizer import Visualizer
 verts = np.random.random((3, 100000)).astype(np.float32)
 
-vis = meshcat.Visualizer().open()
-vis.set_object(g.Points(
-    g.PointsGeometry(verts, color=verts),
-    g.PointsMaterial()
+vis = Visualizer().open()
+vis.set_object(Points(
+    PointsGeometry(verts, color=verts),
+    PointsMaterial(size=0.001)
 ))

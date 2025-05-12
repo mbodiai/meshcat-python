@@ -1,16 +1,17 @@
+from typing import Any
 import webbrowser
 import umsgpack
 import numpy as np
 import zmq
 import io
-from PIL import Image        
+from PIL import Image
 from IPython.display import HTML
 
 
-from .path import Path
-from .commands import SetObject, SetTransform, Delete, SetProperty, SetAnimation, CaptureImage, SetCamTarget
-from .geometry import MeshPhongMaterial
-from .servers.zmqserver import start_zmq_server_as_subprocess
+from meshcat.path import Path
+from meshcat.commands import SetObject, SetTransform, Delete, SetProperty, SetAnimation, CaptureImage, SetCamTarget
+from meshcat.servers.zmqserver import start_zmq_server_as_subprocess
+from meshcat.geometry import Geometry, Material, Mesh, SceneElement
 
 class ViewerWindow:
     context = zmq.Context()
@@ -145,13 +146,13 @@ class Visualizer:
     def __getitem__(self, path):
         return Visualizer.view_into(self.window, self.path.append(path))
 
-    def set_object(self, geometry, material=None):
+    def set_object(self, geometry: "Geometry|Mesh|SceneElement", material: Material | None = None):
         return self.window.send(SetObject(geometry, material, self.path))
 
     def set_transform(self, matrix=np.eye(4)):
         return self.window.send(SetTransform(matrix, self.path))
 
-    def set_property(self, key, value):
+    def set_property(self, key: str, value: Any):
         return self.window.send(SetProperty(key, value, self.path))
 
     def set_animation(self, animation, play=True, repetitions=1):

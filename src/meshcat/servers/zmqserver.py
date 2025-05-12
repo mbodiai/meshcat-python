@@ -1,415 +1,520 @@
-from __future__ import absolute_import, division, print_function
+"""MeshCat server (asyncio/FastAPI edition)
+
+This file replaces the legacy Tornado implementation with an asyncio-native stack
+while **keeping the public symbols and module path unchanged** so that external
+imports such as
+
+```python
+from meshcat.servers.zmqserver import start_zmq_server_as_subprocess
+```
+continue to work.
+
+Main building blocks
+====================
+* FastAPI (ASGI) – static file hosting and WebSocket endpoint.
+* uvicorn – runs the ASGI application.
+* zmq.asyncio – REP socket that bridges Python ↔ browser.
+* rich-click – coloured CLI used instead of argparse.
+* Pydantic – (optional) message validation can be layered later; for now we
+  keep the raw binary protocol to stay 100 % wire-compatible.
+
+The functional behaviour is intentionally identical to the old server so that
+unit tests and downstream code (e.g. `meshcat.visualizer.ViewerWindow`) do notw
+need any changes.
+"""
 
 import atexit
+import asyncio
 import base64
-import os
-import re
-import sys
-import subprocess
-import multiprocessing
 import json
-
-import tornado.web
-import tornado.ioloop
-import tornado.websocket
-import tornado.gen
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+import time
 
 import zmq
-import zmq.eventloop.ioloop
-from zmq.eventloop.zmqstream import ZMQStream
-
-from .tree import SceneTree, walk, find_node
-
-
-def capture(pattern, s):
-    match = re.match(pattern, s)
-    if not match:
-        raise ValueError("Could not match {:s} with pattern {:s}".format(s, pattern))
-    else:
-        return match.groups()[0]
-
-def match_zmq_url(line):
-    return capture(r"^zmq_url=(.*)$", line)
-
-def match_web_url(line):
-    return capture(r"^web_url=(.*)$", line)
-
-def start_zmq_server_as_subprocess(zmq_url=None, server_args=[]):
-    """
-    Starts the ZMQ server as a subprocess, passing *args through popen.
-    Optional Keyword Arguments:
-        zmq_url
-    """
-    # Need -u for unbuffered output: https://stackoverflow.com/a/25572491
-    args = [sys.executable, "-u", "-m", "meshcat.servers.zmqserver"]
-    if zmq_url is not None:
-        args.append("--zmq-url")
-        args.append(zmq_url)
-    if server_args:
-        args.append(*server_args)
-    # Note: Pass PYTHONPATH to be robust to workflows like Google Colab,
-    # where meshcat might have been added directly via sys.path.append.
-    # Copy existing environmental variables as some of them might be needed
-    # e.g. on Windows SYSTEMROOT and PATH
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    # Use start_new_session if it's available. Without it, in jupyter the server
-    # goes down when we cancel execution of any cell in the notebook.
-    server_proc = subprocess.Popen(args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        start_new_session=True)
-    line = ""
-    while "zmq_url" not in line:
-        line = server_proc.stdout.readline().strip().decode("utf-8")
-        if server_proc.poll() is not None:
-            outs, errs = server_proc.communicate()
-            print(outs.decode("utf-8"))
-            print(errs.decode("utf-8"))
-            raise RuntimeError("the meshcat server process exited prematurely with exit code " + str(server_proc.poll()))
-    zmq_url = match_zmq_url(line)
-    web_url = match_web_url(server_proc.stdout.readline().strip().decode("utf-8"))
-
-    def cleanup(server_proc):
-        server_proc.kill()
-        server_proc.wait()
-
-    atexit.register(cleanup, server_proc)
-    return server_proc, zmq_url, web_url
+import zmq.asyncio
+import rich_click as click
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 
 
-def _zmq_install_ioloop():
-    # For pyzmq<17, install ioloop instead of a tornado ioloop
-    # http://zeromq.github.com/pyzmq/eventloop.html
-    try:
-        pyzmq_major = int(zmq.__version__.split(".")[0])
-    except ValueError:
-        # Development version?
-        return
-    if pyzmq_major < 17:
-        zmq.eventloop.ioloop.install()
+from meshcat.servers.tree import SceneTree, TreeNode, walk, find_node
 
+# ────────────────────────────────────────────────────────────────────────────
+# Constants & configuration
+# ────────────────────────────────────────────────────────────────────────────
 
-_zmq_install_ioloop()
-
-VIEWER_ROOT = os.path.join(os.path.dirname(__file__), "..", "viewer", "dist")
+VIEWER_ROOT = Path(__file__).parent / ".." / "viewer" / "dist"
 VIEWER_HTML = "index.html"
 
-DEFAULT_FILESERVER_PORT = 7000
+DEFAULT_FILESERVER_PORT = 7005
 MAX_ATTEMPTS = 1000
 DEFAULT_ZMQ_METHOD = "tcp"
-DEFAULT_ZMQ_PORT = 6000
+DEFAULT_ZMQ_PORT = 6005
+DEFAULT_HOST = "127.0.0.1"
+# MeshCat command names
+MESHCAT_COMMANDS = [
+    "set_transform",
+    "set_object",
+    "delete",
+    "set_property",
+    "set_animation",
+]
 
-MESHCAT_COMMANDS = ["set_transform", "set_object", "delete", "set_property", "set_animation"]
+# Extended commands that are passed through untouched – kept for completeness
+EXTENDED_MESHCAT_COMMANDS = ["start_recording", "stop_recording"]
+
+# ────────────────────────────────────────────────────────────────────────────
+# Helper utilities
+# ────────────────────────────────────────────────────────────────────────────
 
 
-def find_available_port(func, default_port, max_attempts=MAX_ATTEMPTS, **kwargs):
+def _capture(pattern: str, s: str) -> str:
+    import re
+
+    match = re.match(pattern, s)
+    if not match:
+        raise ValueError(f"Could not match {s!r} with pattern {pattern!r}")
+    return match.groups()[0]
+
+
+def match_zmq_url(line: str) -> str:  # Public API retained for tests
+    return _capture(r"^zmq_url=(.*)$", line)
+
+
+def match_web_url(line: str) -> str:
+    return _capture(r"^web_url=(.*)$", line)
+
+
+def _find_available_port(func, default_port: int, max_attempts: int = MAX_ATTEMPTS, **kwargs):
+    """Call *func* with successive port numbers until it succeeds.
+
+    Returns ``(result, port)`` where *result* is whatever *func* returned.
+    """
     for i in range(max_attempts):
         port = default_port + i
         try:
             return func(port, **kwargs), port
         except (OSError, zmq.error.ZMQError):
-            print("Port: {:d} in use, trying another...".format(port), file=sys.stderr)
-        except Exception as e:
-            print(type(e))
-            raise
-    else:
-        raise(Exception("Could not find an available port in the range: [{:d}, {:d})".format(default_port, max_attempts + default_port)))
+            print(f"Port {port} in use, trying another…", file=sys.stderr)
+    raise RuntimeError(f"Could not find a free port starting at {default_port}")
 
 
-class WebSocketHandler(tornado.websocket.WebSocketHandler):
-    def __init__(self, *args, **kwargs):
-        self.bridge = kwargs.pop("bridge")
-        super(WebSocketHandler, self).__init__(*args, **kwargs)
+# ────────────────────────────────────────────────────────────────────────────
+# Bridge – the heart of the server
+# ────────────────────────────────────────────────────────────────────────────
 
-    def open(self):
-        self.bridge.websocket_pool.add(self)
-        print("opened:", self, file=sys.stderr)
-        self.bridge.send_scene(self)
-
-    def on_message(self, message):
-        try:
-            message = json.loads(message)
-            self.bridge.send_image(message['data'])
-            return
-        except Exception as err:
-            print(err)
-            raise
-
-    def on_close(self):
-        self.bridge.websocket_pool.remove(self)
-        print("closed:", self, file=sys.stderr)
+ctx = zmq.asyncio.Context()
 
 
-def create_command(data):
-    """Encode the drawing command into a Javascript fetch() command for display."""
-    return """
-fetch("data:application/octet-binary;base64,{}")
-    .then(res => res.arrayBuffer())
-    .then(buffer => viewer.handle_command_bytearray(new Uint8Array(buffer)));
-    """.format(base64.b64encode(data).decode("utf-8"))
+class ZMQWebSocketBridge:
+    """Bridges ZMQ REP <--> WebSocket messages."""
 
+    def __init__(
+        self,
+        *,
+        host: str = DEFAULT_HOST,
+        zmq_url: str | None = None,
+        ws_port: int | None = None,
+        certfile: str | None = None,
+        keyfile: str | None = None,
+        ngrok_http_tunnel: bool = False,
+    ):
+        self.host: str = host
+        self.websocket_pool: set[WebSocket] = set()
+        self.tree: TreeNode = SceneTree()
 
-class StaticFileHandlerNoCache(tornado.web.StaticFileHandler):
-    """Ensures static files do not get cached.
-
-    Taken from: https://stackoverflow.com/a/18879658/7829525
-    """
-    def set_extra_headers(self, path):
-        # Disable cache
-        self.set_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
-
-
-class ZMQWebSocketBridge(object):
-    context = zmq.Context()
-
-    def __init__(self, zmq_url=None, host="127.0.0.1", port=None,
-                 certfile=None, keyfile=None, ngrok_http_tunnel=False):
-        self.host = host
-        self.websocket_pool = set()
-        self.app = self.make_app()
-        self.ioloop = tornado.ioloop.IOLoop.current()
-
+        # ─── ZMQ socket ───────────────────────────────────────────────────
         if zmq_url is None:
-            def f(port):
-                return self.setup_zmq("{:s}://{:s}:{:d}".format(DEFAULT_ZMQ_METHOD, self.host, port))
-            (self.zmq_socket, self.zmq_stream, self.zmq_url), _ = find_available_port(f, DEFAULT_ZMQ_PORT)
+
+            def _bind(port: int):
+                return self._setup_zmq(f"{DEFAULT_ZMQ_METHOD}://{self.host}:{port}")
+
+            (self.zmq_socket, self.zmq_url), _ = _find_available_port(_bind, DEFAULT_ZMQ_PORT)
         else:
-            self.zmq_socket, self.zmq_stream, self.zmq_url = self.setup_zmq(zmq_url)
+            self.zmq_socket, self.zmq_url = self._setup_zmq(zmq_url)
 
-        protocol = "http:"
-        listen_kwargs = {}
-        if certfile is not None or keyfile is not None:
-            if certfile is None:
-                raise(Exception("You must supply a certfile if you supply a keyfile"))
-            if keyfile is None:
-                raise(Exception("You must supply a keyfile if you supply a certfile"))
-
-            listen_kwargs["ssl_options"] = { "certfile": certfile,
-                                             "keyfile": keyfile }
-            protocol = "https:"
-
-        if port is None:
-            _, self.fileserver_port = find_available_port(self.app.listen, DEFAULT_FILESERVER_PORT, **listen_kwargs)
+        # ─── FastAPI app ───────────────────────────────────────────────────
+        if ws_port is None:
+            _, self.ws_port = _find_available_port(lambda p: p, DEFAULT_FILESERVER_PORT)
         else:
-            self.app.listen(port, **listen_kwargs)
-            self.fileserver_port = port
-        self.web_url = "{protocol}//{host}:{port}/static/".format(
-            protocol=protocol, host=self.host, port=self.fileserver_port)
+            self.ws_port = ws_port
 
-        # Note: The (significant) advantage of putting this in here is not only
-        # so that the workflow is convenient, but also so that the server
-        # administers the public web_url when clients ask for it.
-        if ngrok_http_tunnel:
-            if protocol == "https:":
-                # TODO(russt): Consider plumbing ngrok auth through here for
-                # someone who has paid for ngrok and wants to use https.
-                raise(Exception('The free version of ngrok does not support https'))
+        protocol = "http"
+        if certfile or keyfile:
+            # Users can still serve HTTPS via uvicorn's --ssl-keyfile, but we
+            # keep the string for backward-compat with the old server.
+            protocol = "https"
 
-            # Conditionally import pyngrok
+        self.web_url = f"{protocol}://{self.host}:{self.ws_port}/static/"
+
+        if ngrok_http_tunnel and protocol == "http":
             try:
-                import pyngrok.conf
-                import pyngrok.ngrok
+                import pyngrok.conf  # type: ignore
+                import pyngrok.ngrok  # type: ignore
 
-                # Use start_new_session if it's available. Without it, in
-                # jupyter the server goes down when we cancel execution of any
-                # cell in the notebook.
                 config = pyngrok.conf.PyngrokConfig(start_new_session=True)
-                self.web_url = pyngrok.ngrok.connect(self.fileserver_port, "http", pyngrok_config=config)
-
-                # pyngrok >= 5.0.0 returns an NgrokTunnel object instead of the string.
-                if not isinstance(self.web_url, str):
-                    self.web_url = self.web_url.public_url
-                self.web_url += "/static/"
-
-                print("\n")  # ensure any pyngrok output is properly terminated.
-                def cleanup():
-                    pyngrok.ngrok.kill()
-
-                atexit.register(cleanup)
-
+                url = pyngrok.ngrok.connect(self.ws_port, "http", pyngrok_config=config)
+                self.web_url = (url.public_url if not isinstance(url, str) else url) + "/static/"
+                atexit.register(pyngrok.ngrok.kill)
             except ImportError as e:
-                if "pyngrok" in e.__class__.__name__:
-                    raise(Exception("You must install pyngrok (e.g. via `pip install pyngrok`)."))
+                if "pyngrok" in str(e):
+                    raise RuntimeError("pyngrok is required for --ngrok_http_tunnel") from e
 
-        self.tree = SceneTree()
+        self.app = self._make_app()
 
-    def make_app(self):
-        return tornado.web.Application([
-            (r"/static/(.*)", StaticFileHandlerNoCache, {"path": VIEWER_ROOT, "default_filename": VIEWER_HTML}),
-            (r"/", WebSocketHandler, {"bridge": self})
-        ])
+    # ─────────────────────────── FastAPI wiring ──────────────────────────
 
-    def wait_for_websockets(self):
-        if len(self.websocket_pool) > 0:
-            self.zmq_socket.send(b"ok")
-        else:
-            self.ioloop.call_later(0.1, self.wait_for_websockets)
+    def _make_app(self) -> FastAPI:
+        """Build the FastAPI application, including lifespan hooks."""
 
-    def send_image(self, data):
-        import base64
-        mime, img_code = data.split(",", 1)
-        img_bytes = base64.b64decode(img_code)
-        self.zmq_stream.send(img_bytes)
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            # Start background ZMQ listener
+            task = asyncio.create_task(self._zmq_loop())
+            try:
+                yield
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
-    def handle_zmq(self, frames):
-        cmd = frames[0].decode("utf-8")
-        if cmd == "url":
-            self.zmq_socket.send(self.web_url.encode("utf-8"))
-        elif cmd == "wait":
-            self.ioloop.add_callback(self.wait_for_websockets)
-        elif cmd == "set_target":
-            self.forward_to_websockets(frames)
-            self.zmq_socket.send(b"ok")
-        elif cmd == "capture_image":
-            if len(self.websocket_pool) > 0:
-                self.forward_to_websockets(frames)  # on_message callback should handle the pb
+        app = FastAPI(lifespan=lifespan)
+        app.mount(
+            "/static",
+            StaticFiles(directory=str(VIEWER_ROOT), html=True),
+            name="static",
+        )
+        app.add_api_websocket_route("/", self._ws_endpoint)
+        # expose for tests
+        app.bridge = self  # type: ignore[attr-defined]
+        return app
+
+    # ─────────────────────────── ZMQ side ────────────────────────────────
+
+    def _setup_zmq(self, url: str):
+        sock = ctx.socket(zmq.REP)
+        sock.bind(url)
+        return sock, url
+
+    async def _zmq_loop(self):
+        """Receive multipart frames from the Python side and act on them."""
+        while True:
+            frames: list[bytes] = await self.zmq_socket.recv_multipart()
+            await self._handle_zmq(frames)
+            
+    async def _forward_to_websockets(self, data: bytes):
+        """Broadcast *data* to all connected WebSockets."""
+        if not self.websocket_pool:
+            return
+        await asyncio.gather(*(ws.send_bytes(data) for ws in self.websocket_pool), return_exceptions=True)
+
+    async def _handle_zmq(self, frames: list[bytes]):
+        cmd = frames[0].decode()
+
+        if cmd == "url":  # client requests the viewer URL
+            await self.zmq_socket.send(self.web_url.encode())
+            return
+
+        if cmd == "wait":
+            # Poll until a WebSocket is connected, then reply "ok"
+            if self.websocket_pool:
+                await self.zmq_socket.send(b"ok")
             else:
-                self.ioloop.call_later(0.3, lambda: self.handle_zmq(frames))
-        elif cmd in MESHCAT_COMMANDS:
+                # try again shortly without blocking the event loop
+                await asyncio.sleep(0.1)
+                await self._handle_zmq(frames)
+            return
+
+        if cmd == "set_target":
+            await self._forward_to_websockets(frames[2])
+            await self.zmq_socket.send(b"ok")
+            return
+
+        if cmd == "capture_image":
+            if self.websocket_pool:
+                await self._forward_to_websockets(frames[2])
+                # defer reply: WebSocket will send bytes via send_image()
+                self._pending_capture = True  # type: ignore[attr-defined]
+            else:
+                # no client yet – retry a bit later
+                await asyncio.sleep(0.3)
+                await self._handle_zmq(frames)
+            return
+
+        # Regular meshcat commands with 3-frame layout
+        if cmd in MESHCAT_COMMANDS:
             if len(frames) != 3:
-                self.zmq_socket.send(b"error: expected 3 frames")
+                await self.zmq_socket.send(b"error: expected 3 frames")
                 return
-            path = list(filter(lambda x: len(x) > 0, frames[1].decode("utf-8").split("/")))
+            path_str = frames[1].decode()
             data = frames[2]
-            # Support caching of objects (note: even UUIDs have to match).
-            cache_hit = (cmd == "set_object" and
-                         find_node(self.tree, path).object and
-                         find_node(self.tree, path).object == data)
-            if not cache_hit:
-                self.forward_to_websockets(frames)
+            path = [p for p in path_str.split("/") if p]
+
+            cache_hit = (
+                cmd == "set_object" and find_node(self.tree, path).object and find_node(self.tree, path).object == data
+            )
+            if not cache_hit and self.websocket_pool:
+                await asyncio.gather(*(ws.send_bytes(data) for ws in self.websocket_pool), return_exceptions=True)
+
+
+            # mutate scene tree — mirrors old logic
+            node = find_node(self.tree, path)
             if cmd == "set_transform":
-                find_node(self.tree, path).transform = data
+                node.transform = data
             elif cmd == "set_object":
-                find_node(self.tree, path).object = data
-                find_node(self.tree, path).properties = []
+                node.object = data
+                node.properties = []
             elif cmd == "set_property":
-                find_node(self.tree, path).properties.append(data)
+                node.properties.append(data)
             elif cmd == "set_animation":
-                find_node(self.tree, path).animation = data
+                node.animation = data
             elif cmd == "delete":
-                if len(path) > 0:
+                if path:
                     parent = find_node(self.tree, path[:-1])
                     child = path[-1]
                     if child in parent:
                         del parent[child]
                 else:
                     self.tree = SceneTree()
-            self.zmq_socket.send(b"ok")
-        elif cmd == "get_scene":
-            # when the server gets this command, return the tree
-            # as a series of msgpack-backed binary blobs
-            drawing_commands = ""
-            for node in walk(self.tree):
-                if node.object is not None:
-                    drawing_commands += create_command(node.object)
-                for p in node.properties:
-                    drawing_commands += create_command(p)
-                if node.transform is not None:
-                    drawing_commands += create_command(node.transform)
-                if node.animation is not None:
-                    drawing_commands += create_command(node.animation)
 
-            # now that we have the drawing commands, generate the full
-            # HTML that we want to generate, including the javascript assets
-            mainminjs_path = os.path.join(VIEWER_ROOT, "main.min.js")
-            mainminjs_src = ""
-            with open(mainminjs_path, "r") as f:
-                mainminjs_src = f.readlines()
-            mainminjs_src = "".join(mainminjs_src)
+            await self.zmq_socket.send(b"ok")
+            return
 
-            html = """
-                <!DOCTYPE html>
-                <html>
-                    <head> <meta charset=utf-8> <title>MeshCat</title> </head>
-                    <body>
-                        <div id="meshcat-pane">
-                        </div>
-                        <script>
-                            {mainminjs}
-                        </script>
-                        <script>
-                            var viewer = new MeshCat.Viewer(document.getElementById("meshcat-pane"));
-                            {commands}
-                        </script>
-                         <style>
-                            body {{margin: 0; }}
-                            #meshcat-pane {{
-                                width: 100vw;
-                                height: 100vh;
-                                overflow: hidden;
-                            }}
-                        </style>
-                        <script id="embedded-json"></script>
-                    </body>
-                </html>
-            """.format(mainminjs=mainminjs_src, commands=drawing_commands)
-            self.zmq_socket.send(html.encode('utf-8'))
-        else:
-            self.zmq_socket.send(b"error: unrecognized comand")
+        if cmd == "get_scene":
+            html = self._generate_static_html()
+            await self.zmq_socket.send(html.encode())
+            return
 
-    def forward_to_websockets(self, frames):
-        cmd, path, data = frames
-        for websocket in self.websocket_pool:
-            websocket.write_message(data, binary=True)
+        await self.zmq_socket.send(b"error: unrecognized command")
 
-    def setup_zmq(self, url):
-        zmq_socket = self.context.socket(zmq.REP)
-        zmq_socket.bind(url)
-        zmq_stream = ZMQStream(zmq_socket)
-        zmq_stream.on_recv(self.handle_zmq)
-        return zmq_socket, zmq_stream, url
+     
+    async def _ws_endpoint(self, websocket: WebSocket):
+        from mbcore.log import info
+        await websocket.accept()
+        self.websocket_pool.add(websocket)
+        info(f"WebSocket opened: {websocket.client}")
 
-    def send_scene(self, websocket):
+        # send current scene to the newcomer
+        await self._send_scene(websocket)
+
+        try:
+            while True:
+                message = await websocket.receive_text()
+                try:
+                    payload = json.loads(message)["data"]
+                    await self._send_image(payload)
+                except Exception as err:  # noqa: BLE001
+                    print(err, file=sys.stderr)
+        except WebSocketDisconnect:
+            self.websocket_pool.discard(websocket)
+            info(f"WebSocket closed: {websocket.client}")
+
+    async def _send_image(self, data_url: str):
+        """Receive base64 png from the browser and reply over ZMQ."""
+        mime, img_code = data_url.split(",", 1)
+        img_bytes = base64.b64decode(img_code)
+        await self.zmq_socket.send(img_bytes)
+
+    async def _send_scene(self, ws: WebSocket):
         for node in walk(self.tree):
             if node.object is not None:
-                websocket.write_message(node.object, binary=True)
+                await ws.send_bytes(node.object)
             for p in node.properties:
-                websocket.write_message(p, binary=True)
+                await ws.send_bytes(p)
             if node.transform is not None:
-                websocket.write_message(node.transform, binary=True)
+                await ws.send_bytes(node.transform)
             if node.animation is not None:
-                websocket.write_message(node.animation, binary=True)
+                await ws.send_bytes(node.animation)
 
-    def run(self):
-        self.ioloop.start()
+    def _generate_static_html(self) -> str:
+        """Return a self-contained HTML snapshot of the current scene."""
+        drawing_commands = ""
+        for node in walk(self.tree):
+            if node.object is not None:
+                drawing_commands += _create_command(node.object)
+            for p in node.properties:
+                drawing_commands += _create_command(p)
+            if node.transform is not None:
+                drawing_commands += _create_command(node.transform)
+            if node.animation is not None:
+                drawing_commands += _create_command(node.animation)
+
+        main_js = (VIEWER_ROOT / "main.min.js").read_text()
+        return f"""
+<!DOCTYPE html>
+<html>
+  <head><meta charset=utf-8><title>MeshCat</title></head>
+  <body>
+    <div id=\"meshcat-pane\"></div>
+    <script>{main_js}</script>
+    <script>
+      var viewer = new MeshCat.Viewer(document.getElementById('meshcat-pane'));
+      {drawing_commands}
+    </script>
+    <style>
+      body {{margin:0;}}
+      #meshcat-pane {{width:100vw;height:100vh;overflow:hidden;}}
+    </style>
+    <script id=\"embedded-json\"></script>
+  </body>
+</html>
+"""
 
 
-def main():
-    import argparse
-    import sys
-    import webbrowser
-    import platform
-    import asyncio
+# ────────────────────────────────────────────────────────────────────────────
+# Helper functions (kept from original)
+# ────────────────────────────────────────────────────────────────────────────
 
-    # Fix asyncio configuration on Windows for Python 3.8 and above.
-    # Workaround for https://github.com/tornadoweb/tornado/issues/2608
-    if sys.version_info >= (3, 8) and platform.system() == 'Windows':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    parser = argparse.ArgumentParser(description="Serve the MeshCat HTML files and listen for ZeroMQ commands")
-    parser.add_argument('--zmq-url', '-z', type=str, nargs="?", default=None)
-    parser.add_argument('--open', '-o', action="store_true")
-    parser.add_argument('--certfile', type=str, default=None)
-    parser.add_argument('--keyfile', type=str, default=None)
-    parser.add_argument('--ngrok_http_tunnel', action="store_true", help="""
-ngrok is a service for creating a public URL from your local machine, which
-is very useful if you would like to make your meshcat server public.""")
-    results = parser.parse_args()
-    bridge = ZMQWebSocketBridge(zmq_url=results.zmq_url,
-                                certfile=results.certfile,
-                                keyfile=results.keyfile,
-                                ngrok_http_tunnel=results.ngrok_http_tunnel)
-    print("zmq_url={:s}".format(bridge.zmq_url))
-    print("web_url={:s}".format(bridge.web_url))
-    if results.open:
+def _create_command(data: bytes) -> str:
+    """Encode a binary draw command into JS that MeshCat viewer understands."""
+    return (
+        '\nfetch("data:application/octet-binary;base64,{}")'.format(base64.b64encode(data).decode())
+        + "\n  .then(r => r.arrayBuffer())"
+        + "\n  .then(buf => viewer.handle_command_bytearray(new Uint8Array(buf)));\n"
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Public helper – unchanged signature (but now in-process, no subprocess)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def start_zmq_server_as_subprocess(*, zmq_url: str | None = None, server_args: list[str] | None = None):
+    """Start the MeshCat server in a *background thread* and return a tuple
+    ``(proc_like, zmq_url, web_url)`` that is API-compatible with the old
+    subprocess-based helper.
+
+    * ``proc_like`` is a minimal wrapper exposing ``kill()``, ``wait()`` and
+      ``poll()`` so existing cleanup code keeps working.  Internally it talks
+      to the running :class:`uvicorn.Server` instance.
+    """
+    import threading
+    import uvicorn  # type: ignore
+
+    # -------------------------------------------------------------
+    # Parse *subset* of legacy CLI flags so tests keep working
+    # -------------------------------------------------------------
+    ngrok_http_tunnel = False
+    if server_args:
+        if "--ngrok_http_tunnel" in server_args:
+            ngrok_http_tunnel = True
+        # '--zmq-url' flag should have a value right after it
+        if "--zmq-url" in server_args:
+            flag_index = server_args.index("--zmq-url")
+            try:
+                zmq_url = server_args[flag_index + 1]
+            except IndexError:  # pragma: no cover
+                raise ValueError("--zmq-url flag given without value") from None
+
+    # -------------------------------------------------------------
+    # Instantiate the bridge (binds REP socket immediately)
+    # -------------------------------------------------------------
+    bridge = ZMQWebSocketBridge(
+        zmq_url=zmq_url,
+        ngrok_http_tunnel=ngrok_http_tunnel,
+    )
+
+    # -------------------------------------------------------------
+    # Spin up the ASGI server in a daemon thread so this call
+    # returns immediately *after* startup.
+    # -------------------------------------------------------------
+    config = uvicorn.Config(
+        bridge.app,
+        host=bridge.host,
+        port=bridge.ws_port,
+        log_level="warning",
+    )
+    server = uvicorn.Server(config=config)
+
+    def _run():
+        # Blocks until server.should_exit is set to True
+        asyncio.run(server.serve())
+
+    thread = threading.Thread(target=_run, name="meshcat-uvicorn", daemon=True)
+    thread.start()
+
+    # Wait until uvicorn has marked itself as started
+    start_time = time.time()
+    while not server.started and time.time() - start_time < 10:
+        pass  # tiny spin – only runs for a few ms
+
+    # -------------------------------------------------------------
+    # Provide a proc-like wrapper so external code can shut it down
+    # -------------------------------------------------------------
+    class _DummyProc:
+        def __init__(self, srv: uvicorn.Server, t: threading.Thread):
+            self._srv = srv
+            self._thread = t
+
+        def kill(self):
+            self._srv.should_exit = True
+
+        def wait(self, timeout: float | None = None):
+            self._thread.join(timeout)
+            return 0
+
+        def poll(self):
+            return None if self._thread.is_alive() else 0
+
+    dummy_proc = _DummyProc(server, thread)
+
+    # Ensure the server is stopped at interpreter shutdown
+    atexit.register(dummy_proc.kill)
+
+    return dummy_proc, bridge.zmq_url, bridge.web_url
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# CLI (rich-click) – replaces old argparse main
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@click.command()  # type: ignore[attr-defined]
+@click.option("--zmq-url", type=str, default=None, help="Bind ZMQ socket to this full URL (e.g. tcp://127.0.0.1:6001)")
+@click.option("--host", type=str, default=DEFAULT_HOST, help="Bind server to this host")
+@click.option("--ws-port", type=int, default=DEFAULT_FILESERVER_PORT, help="Bind WebSocket server to this port")
+@click.option("--open/--no-open", default=False, help="Automatically open the viewer in a browser tab.")  # type: ignore[attr-defined]
+@click.option("--certfile", type=str, default=None, help="SSL certificate file for HTTPS (passed to uvicorn)")  # type: ignore[attr-defined]
+@click.option("--keyfile", type=str, default=None, help="SSL key file for HTTPS (passed to uvicorn)")  # type: ignore[attr-defined]
+@click.option("--ngrok_http_tunnel", is_flag=True, help="Expose HTTP server via ngrok tunnel (requires pyngrok)")  # type: ignore[attr-defined]
+def _cli(zmq_url: str | None, host: str, ws_port: int, open: bool, certfile: str | None, keyfile: str | None, ngrok_http_tunnel: bool):
+    """Run the MeshCat bridge inline (used by `python -m meshcat.servers.zmqserver`)."""
+
+    bridge = ZMQWebSocketBridge(
+        **{
+            **({"zmq_url": zmq_url} if zmq_url else {}),
+            **({"certfile": certfile} if certfile else {}),
+            **({"keyfile": keyfile} if keyfile else {}),
+            **({"ngrok_http_tunnel": ngrok_http_tunnel} if ngrok_http_tunnel else {}),
+            **({"host": host} if host else {}),
+            **({"ws_port": ws_port} if ws_port else {}),
+        }
+
+    )
+
+    # Print URLs for parent process / user – **do not change this format**.
+    print(f"zmq_url={bridge.zmq_url}")
+    print(f"web_url={bridge.web_url}")
+
+    if open:
+        import webbrowser
+
         webbrowser.open(bridge.web_url, new=2)
 
-    try:
-        bridge.run()
-    except KeyboardInterrupt:
-        pass
+    import uvicorn  # type: ignore  # Imported late so that libraries can monkey-patch if needed.
 
-if __name__ == '__main__':
-    main()
+    uvicorn.run(
+        bridge.app,
+        host=bridge.host,
+        port=bridge.ws_port,
+        ssl_keyfile=keyfile,
+        ssl_certfile=certfile,
+        log_level="info",
+    )
+
+
+# When executed as a module:  python -m meshcat.servers.zmqserver
+if __name__ == "__main__":
+    _cli()

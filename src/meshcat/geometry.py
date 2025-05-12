@@ -1,28 +1,40 @@
 import base64
 import uuid
+from numpy.typing import ArrayLike
 from io import StringIO, BytesIO
 import umsgpack
 import numpy as np
-
-from . import transformations as tf
+from meshcat.transformations import identity_matrix
 
 
 class SceneElement(object):
+    _type: str | None = None
+    field: str | None = None
+
     def __init__(self):
         self.uuid = str(uuid.uuid1())
-
+    
 
 class ReferenceSceneElement(SceneElement):
-    def lower_in_object(self, object_data):
+    field: str # type: ignore
+    def lower_in_object(self, object_data:dict[str,list]):
         object_data.setdefault(self.field, []).append(self.lower(object_data))
         return self.uuid
+
+    def lower(self, object_data:dict) -> dict:
+        """
+        Placeholder lower method. Subclasses should implement their specific
+        logic for converting the object to a dictionary representation.
+        """
+        raise NotImplementedError("Subclasses must implement the lower() method.")
 
 
 class Geometry(ReferenceSceneElement):
     field = "geometries"
 
+
     def intrinsic_transform(self):
-        return tf.identity_matrix()
+        return identity_matrix()
 
 
 class Material(ReferenceSceneElement):
@@ -39,31 +51,31 @@ class Image(ReferenceSceneElement):
 
 class Box(Geometry):
     def __init__(self, lengths):
-        super(Box, self).__init__()
+        super().__init__()
         self.lengths = lengths
 
     def lower(self, object_data):
         return {
-            u"uuid": self.uuid,
-            u"type": u"BoxGeometry",
-            u"width": self.lengths[0],
-            u"height": self.lengths[1],
-            u"depth": self.lengths[2]
+            "uuid": self.uuid,
+            "type": "BoxGeometry",
+            "width": self.lengths[0],
+            "height": self.lengths[1],
+            "depth": self.lengths[2]
         }
 
 
 class Sphere(Geometry):
-    def __init__(self, radius):
-        super(Sphere, self).__init__()
+    def __init__(self, radius:float):
+        super().__init__()
         self.radius = radius
 
     def lower(self, object_data):
         return {
-            u"uuid": self.uuid,
-            u"type": u"SphereGeometry",
-            u"radius": self.radius,
-            u"widthSegments" : 20,
-            u"heightSegments" : 20
+            "uuid": self.uuid,
+            "type": "SphereGeometry",
+            "radius": self.radius,
+            "widthSegments" : 20,
+            "heightSegments" : 20
         }
 
 
@@ -72,9 +84,9 @@ class Ellipsoid(Sphere):
     An Ellipsoid is treated as a Sphere of unit radius, with an affine
     transformation applied to distort it into the ellipsoidal shape
     """
-    def __init__(self, radii):
-        super(Ellipsoid, self).__init__(1.0)
-        self.radii = radii
+    def __init__(self, radii:ArrayLike):
+        super().__init__(1.0)
+        self.radii = np.asarray(radii, dtype=np.float32)
 
     def intrinsic_transform(self):
         return np.diag(np.hstack((self.radii, 1.0)))
@@ -82,8 +94,8 @@ class Ellipsoid(Sphere):
 
 class Plane(Geometry):
 
-    def __init__(self, width=1, height=1, widthSegments=1, heightSegments=1):
-        super(Plane, self).__init__()
+    def __init__(self, width:float=1.0, height:float=1.0, widthSegments:int=1, heightSegments:int=1):
+        super().__init__()
         self.width = width
         self.height = height
         self.widthSegments = widthSegments
@@ -91,22 +103,22 @@ class Plane(Geometry):
 
     def lower(self, object_data):
         return {
-            u"uuid": self.uuid,
-            u"type": u"PlaneGeometry",
-            u"width": self.width,
-            u"height": self.height,
-            u"widthSegments": self.widthSegments,
-            u"heightSegments": self.heightSegments,
+            "uuid": self.uuid,
+            "type": "PlaneGeometry",
+            "width": self.width,
+            "height": self.height,
+            "widthSegments": self.widthSegments,
+            "heightSegments": self.heightSegments,
         }
 
 
-"""
-A cylinder of the given height and radius. By Three.js convention, the axis of
-rotational symmetry is aligned with the y-axis.
-"""
+
 class Cylinder(Geometry):
+    """A cylinder of the given height and radius. By Three.js convention, the axis of
+    rotational symmetry is aligned with the y-axis.
+    """
     def __init__(self, height, radius=1.0, radiusTop=None, radiusBottom=None):
-        super(Cylinder, self).__init__()
+        super().__init__()
         if radiusTop is not None and radiusBottom is not None:
             self.radiusTop = radiusTop
             self.radiusBottom = radiusBottom
@@ -118,24 +130,25 @@ class Cylinder(Geometry):
 
     def lower(self, object_data):
         return {
-            u"uuid": self.uuid,
-            u"type": u"CylinderGeometry",
-            u"radiusTop": self.radiusTop,
-            u"radiusBottom": self.radiusBottom,
-            u"height": self.height,
-            u"radialSegments": self.radialSegments
+            "uuid": self.uuid,
+            "type": "CylinderGeometry",
+            "radiusTop": self.radiusTop,
+            "radiusBottom": self.radiusBottom,
+            "height": self.height,
+            "radialSegments": self.radialSegments
         }
 
 
 class GenericMaterial(Material):
-    def __init__(self, color=0xffffff, reflectivity=0.5, map=None,
-                 side = 2, transparent = None, opacity = 1.0,
-                 linewidth = 1.0,
-                 wireframe = False,
-                 wireframeLinewidth = 1.0,
-                 vertexColors=False,
+    _type:str
+    def __init__(self, color:int=0xffffff, reflectivity:float=0.5, map:Texture|None=None,
+                 side:int=2, transparent:bool|None=None, opacity:float=1.0,
+                 linewidth:float=1.0,
+                 wireframe:bool=False,
+                 wireframeLinewidth:float=1.0,
+                 vertexColors:bool=False,
                  **kwargs):
-        super(GenericMaterial, self).__init__()
+        super().__init__()
         self.color = color
         self.reflectivity = reflectivity
         self.map = map
@@ -160,47 +173,47 @@ class GenericMaterial(Material):
         else:
             transparent = self.transparent
         data = {
-            u"uuid": self.uuid,
-            u"type": self._type,
-            u"color": self.color,
-            u"reflectivity": self.reflectivity,
-            u"side": self.side,
-            u"transparent": transparent,
-            u"opacity": self.opacity,
-            u"linewidth": self.linewidth,
-            u"wireframe": bool(self.wireframe),
-            u"wireframeLinewidth": self.wireframeLinewidth,
-            u"vertexColors": (2 if self.vertexColors else 0),  # three.js wants an enum
+            "uuid": self.uuid,
+            "type": self._type,
+            "color": self.color,
+            "reflectivity": self.reflectivity,
+            "side": self.side,
+            "transparent": transparent,
+            "opacity": self.opacity,
+            "linewidth": self.linewidth,
+            "wireframe": bool(self.wireframe),
+            "wireframeLinewidth": self.wireframeLinewidth,
+            "vertexColors": (2 if self.vertexColors else 0),  # three.js wants an enum
         }
         data.update(self.properties)
         if self.map is not None:
-            data[u"map"] = self.map.lower_in_object(object_data)
+            data["map"] = self.map.lower_in_object(object_data)
         return data
 
 
 class MeshBasicMaterial(GenericMaterial):
-    _type=u"MeshBasicMaterial"
+    _type="MeshBasicMaterial"
 
 
 class MeshPhongMaterial(GenericMaterial):
-    _type=u"MeshPhongMaterial"
+    _type="MeshPhongMaterial"
 
 
 class MeshLambertMaterial(GenericMaterial):
-    _type=u"MeshLambertMaterial"
+    _type="MeshLambertMaterial"
 
 
 class MeshToonMaterial(GenericMaterial):
-    _type=u"MeshToonMaterial"
+    _type="MeshToonMaterial"
 
 
 class LineBasicMaterial(GenericMaterial):
-    _type=u"LineBasicMaterial"
+    _type="LineBasicMaterial"
 
 
 class PngImage(Image):
     def __init__(self, data):
-        super(PngImage, self).__init__()
+        super().__init__()
         self.data = data
 
     @staticmethod
@@ -210,14 +223,14 @@ class PngImage(Image):
 
     def lower(self, object_data):
         return {
-            u"uuid": self.uuid,
-            u"url": str("data:image/png;base64," + base64.b64encode(self.data).decode('ascii'))
+            "uuid": self.uuid,
+            "url": str("data:image/png;base64," + base64.b64encode(self.data).decode('ascii'))
         }
 
 
 class TextTexture(Texture):
     def __init__(self, text, font_size=100, font_face='sans-serif'):
-        super(TextTexture, self).__init__()
+        super().__init__()
         self.text = text
         # font_size will be passed to the JS side as is; however if the
         # text width exceeds canvas width, font_size will be reduced.
@@ -226,31 +239,34 @@ class TextTexture(Texture):
 
     def lower(self, object_data):
         return {
-            u"uuid": self.uuid,
-            u"type": u"_text",
-            u"text": self.text,
-            u"font_size": self.font_size,
-            u"font_face": self.font_face,
+            "uuid": self.uuid,
+            "type": "_text",
+            "text": self.text,
+            "font_size": self.font_size,
+            "font_face": self.font_face,
         }
 
 
 class GenericTexture(Texture):
     def __init__(self, properties):
-        super(GenericTexture, self).__init__()
+        super().__init__()
         self.properties = properties
 
     def lower(self, object_data):
-        data = {u"uuid": self.uuid}
+        data = {"uuid": self.uuid}
         data.update(self.properties)
-        if u"image" in data:
-            image = data[u"image"]
-            data[u"image"] = image.lower_in_object(object_data)
+        if "image" in data:
+            image_element = data["image"]
+            # The original code implies image_element has lower_in_object.
+            # If image_element is a string (UUID), this will error at runtime.
+            # Keeping original logic as requested.
+            data["image"] = image_element.lower_in_object(object_data) # type: ignore
         return data
 
 
 class ImageTexture(Texture):
     def __init__(self, image, wrap=[1001, 1001], repeat=[1, 1], **kwargs):
-        super(ImageTexture, self).__init__()
+        super().__init__()
         self.image = image
         self.wrap = wrap
         self.repeat = repeat
@@ -258,35 +274,37 @@ class ImageTexture(Texture):
 
     def lower(self, object_data):
         data = {
-            u"uuid": self.uuid,
-            u"wrap": self.wrap,
-            u"repeat": self.repeat,
-            u"image": self.image.lower_in_object(object_data)
+            "uuid": self.uuid,
+            "wrap": self.wrap,
+            "repeat": self.repeat,
+            "image": self.image.lower_in_object(object_data)
         }
         data.update(self.properties)
         return data
 
 
 class Object(SceneElement):
-    def __init__(self, geometry, material=MeshPhongMaterial()):
-        super(Object, self).__init__()
+    _type: str # Mesh, Points, Line etc.
+
+    def __init__(self, geometry:"Geometry", material:"Material|None"=None):
+        super().__init__()
         self.geometry = geometry
-        self.material = material
+        self.material = material or MeshLambertMaterial()
 
     def lower(self):
         data = {
-            u"metadata": {
-                u"version": 4.5,
-                u"type": u"Object",
+            "metadata": {
+                "version": 4.5,
+                "type": "Object",
             },
-            u"geometries": [],
-            u"materials": [],
-            u"object": {
-                u"uuid": self.uuid,
-                u"type": self._type,
-                u"geometry": self.geometry.uuid,
-                u"material": self.material.uuid,
-                u"matrix": list(self.geometry.intrinsic_transform().flatten())
+            "geometries": [],
+            "materials": [],
+            "object": {
+                "uuid": self.uuid,
+                "type": self._type,
+                "geometry": self.geometry.uuid,
+                "material": self.material.uuid,
+                "matrix": list(self.geometry.intrinsic_transform().flatten())
             }
         }
         self.geometry.lower_in_object(data)
@@ -295,12 +313,12 @@ class Object(SceneElement):
 
 
 class Mesh(Object):
-    _type = u"Mesh"
+    _type = "Mesh"
 
 
 class OrthographicCamera(SceneElement):
     def __init__(self, left, right, top, bottom, near, far, zoom=1):
-        super(OrthographicCamera, self).__init__()
+        super().__init__()
         self.left = left
         self.right = right
         self.top = top
@@ -311,16 +329,16 @@ class OrthographicCamera(SceneElement):
 
     def lower(self):
         data = {
-            u"object": {
-                u"uuid": self.uuid,
-                u"type": u"OrthographicCamera",
-                u"left": self.left,
-                u"right": self.right,
-                u"top": self.top,
-                u"bottom": self.bottom,
-                u"near": self.near,
-                u"far": self.far,
-                u"zoom": self.zoom,
+            "object": {
+                "uuid": self.uuid,
+                "type": "OrthographicCamera",
+                "left": self.left,
+                "right": self.right,
+                "top": self.top,
+                "bottom": self.bottom,
+                "near": self.near,
+                "far": self.far,
+                "zoom": self.zoom,
             }
         }
         return data
@@ -331,8 +349,8 @@ class PerspectiveCamera(SceneElement):
     https://threejs.org/docs/#api/en/cameras/PerspectiveCamera for more
     information.
     """
-    def __init__(self, fov = 50, aspect = 1, near = 0.1, far = 2000,
-                 zoom = 1, filmGauge=35, filmOffset = 0, focus = 10):
+    def __init__(self, fov:float=50, aspect:float=1, near:float=0.1, far:float=2000,
+                 zoom:float=1, filmGauge:float=35, filmOffset:float=0, focus:float=10):
         """
         fov   : Camera frustum vertical field of view, from bottom to top of view, in degrees. Default is 50.
         aspect: Camera frustum aspect ratio, usually the canvas width / canvas height. Default is 1 (square canvas).
@@ -347,8 +365,7 @@ class PerspectiveCamera(SceneElement):
         focus: Object distance used for stereoscopy and depth-of-field effects. This parameter does not influence
                the projection matrix unless a StereoCamera is being used. Default is 10.
         """
-        #super(PerspectiveCamera, self).__init__()
-        SceneElement.__init__(self)
+        super().__init__()
         self.fov = fov
         self.aspect = aspect
         self.far = far
@@ -360,17 +377,17 @@ class PerspectiveCamera(SceneElement):
 
     def lower(self):
         data = {
-            u"object": {
-                u"uuid": self.uuid,
-                u"type": u"PerspectiveCamera",
-                u"aspect": self.aspect,
-                u"far": self.far,
-                u"filmGauge": self.filmGauge,
-                u"filmOffset": self.filmOffset,
-                u"focus": self.focus,
-                u"fov": self.fov,
-                u"near": self.near,
-                u"zoom": self.zoom,
+            "object": {
+                "uuid": self.uuid,
+                "type": "PerspectiveCamera",
+                "aspect": self.aspect,
+                "far": self.far,
+                "filmGauge": self.filmGauge,
+                "filmOffset": self.filmOffset,
+                "focus": self.focus,
+                "fov": self.fov,
+                "near": self.near,
+                "zoom": self.zoom,
             }
         }
         return data
@@ -386,26 +403,26 @@ def item_size(array):
 
 def threejs_type(dtype):
     if dtype == np.uint8:
-        return u"Uint8Array", 0x12
+        return "Uint8Array", 0x12
     elif dtype == np.int32:
-        return u"Int32Array", 0x15
+        return "Int32Array", 0x15
     elif dtype == np.uint32:
-        return u"Uint32Array", 0x16
+        return "Uint32Array", 0x16
     elif dtype == np.float32:
-        return u"Float32Array", 0x17
+        return "Float32Array", 0x17
     else:
         raise ValueError("Unsupported datatype: " + str(dtype))
 
 
-def pack_numpy_array(x):
+def pack_numpy_array(x:np.ndarray):
     if x.dtype == np.float64:
         x = x.astype(np.float32)
     typename, extcode = threejs_type(x.dtype)
     return {
-        u"itemSize": item_size(x),
-        u"type": typename,
-        u"array": umsgpack.Ext(extcode, x.tobytes('F')),
-        u"normalized": False
+        "itemSize": item_size(x),
+        "type": typename,
+        "array": umsgpack.Ext(extcode, x.tobytes('F')),
+        "normalized": False
     }
 
 
@@ -420,51 +437,51 @@ def data_from_stream(stream):
 
 
 class MeshGeometry(Geometry):
-    def __init__(self, contents, mesh_format):
-        super(MeshGeometry, self).__init__()
+    def __init__(self, contents:str, mesh_format:str):
+        super().__init__()
         self.contents = contents
         self.mesh_format = mesh_format
 
     def lower(self, object_data):
         return {
-            u"type": u"_meshfile_geometry",
-            u"uuid": self.uuid,
-            u"format": self.mesh_format,
-            u"data": self.contents
+            "type": "_meshfile_geometry",
+            "uuid": self.uuid,
+            "format": self.mesh_format,
+            "data": self.contents
         }
 
 
 class ObjMeshGeometry(MeshGeometry):
-    def __init__(self, contents):
-        super(ObjMeshGeometry, self, contents, u"obj").__init__()
+    def __init__(self, contents:str):
+        super().__init__(contents, "obj")
 
     @staticmethod
     def from_file(fname):
         with open(fname, "r") as f:
-            return MeshGeometry(f.read(), u"obj")
+            return MeshGeometry(f.read(), "obj")
 
     @staticmethod
     def from_stream(f):
-        return MeshGeometry(data_from_stream(f), u"obj")
+        return MeshGeometry(data_from_stream(f), "obj")
 
 
 class DaeMeshGeometry(MeshGeometry):
-    def __init__(self, contents):
-        super(DaeMeshGeometry, self, contents, u"dae").__init__()
+    def __init__(self, contents:str):
+        super().__init__(contents, "dae")  
 
     @staticmethod
     def from_file(fname):
         with open(fname, "r") as f:
-            return MeshGeometry(f.read(), u"dae")
+            return MeshGeometry(f.read(), "dae")
 
     @staticmethod
     def from_stream(f):
-        return MeshGeometry(data_from_stream(f), u"dae")
+        return MeshGeometry(data_from_stream(f), "dae")
 
 
 class StlMeshGeometry(MeshGeometry):
-    def __init__(self, contents):
-        super(StlMeshGeometry, self, contents, u"stl").__init__()
+    def __init__(self, contents:str):
+        super().__init__(contents, "stl")
 
     @staticmethod
     def from_file(fname):
@@ -472,7 +489,7 @@ class StlMeshGeometry(MeshGeometry):
             arr = np.frombuffer(f.read(), dtype=np.uint8)
             _, extcode = threejs_type(np.uint8)
             encoded = umsgpack.Ext(extcode, arr.tobytes())
-            return MeshGeometry(encoded, u"stl")
+            return MeshGeometry(encoded, "stl")
 
     @staticmethod
     def from_stream(f):
@@ -484,7 +501,7 @@ class StlMeshGeometry(MeshGeometry):
             raise ValueError('Stream must be instance of StringIO or BytesIO, not {}'.format(type(f)))
         _, extcode = threejs_type(np.uint8)
         encoded = umsgpack.Ext(extcode, arr.tobytes())
-        return MeshGeometry(encoded, u"stl")
+        return MeshGeometry(encoded, "stl")
 
 
 class TriangularMeshGeometry(Geometry):
@@ -516,8 +533,8 @@ class TriangularMeshGeometry(Geometry):
     """
     __slots__ = ["vertices", "faces"]
 
-    def __init__(self, vertices, faces, color=None):
-        super(TriangularMeshGeometry, self).__init__()
+    def __init__(self, vertices:np.ndarray, faces:np.ndarray, color:np.ndarray|None=None):
+        super().__init__()
 
         vertices = np.asarray(vertices, dtype=np.float32)
         faces = np.asarray(faces, dtype=np.uint32)
@@ -531,59 +548,59 @@ class TriangularMeshGeometry(Geometry):
         self.color = color
 
     def lower(self, object_data):
-        attrs = {u"position": pack_numpy_array(self.vertices.T)}
+        attrs = {"position": pack_numpy_array(self.vertices.T)}
         if self.color is not None:
-            attrs[u"color"] = pack_numpy_array(self.color.T)
+            attrs["color"] = pack_numpy_array(self.color.T)
         return {
-            u"uuid": self.uuid,
-            u"type": u"BufferGeometry",
-            u"data": {
-                u"attributes": attrs,
-                u"index": pack_numpy_array(self.faces.T)
+            "uuid": self.uuid,
+            "type": "BufferGeometry",
+            "data": {
+                "attributes": attrs,
+                "index": pack_numpy_array(self.faces.T)
             }
         }
 
 
 class PointsGeometry(Geometry):
-    def __init__(self, position, color=None):
-        super(PointsGeometry, self).__init__()
+    def __init__(self, position:np.ndarray, color:np.ndarray|None=None):
+        super().__init__()
         self.position = position
         self.color = color
 
     def lower(self, object_data):
-        attrs = {u"position": pack_numpy_array(self.position)}
+        attrs = {"position": pack_numpy_array(self.position)}
         if self.color is not None:
-            attrs[u"color"] = pack_numpy_array(self.color)
+            attrs["color"] = pack_numpy_array(self.color)
         return {
-            u"uuid": self.uuid,
-            u"type": u"BufferGeometry",
-            u"data": {
-                u"attributes": attrs
+            "uuid": self.uuid,
+            "type": "BufferGeometry",
+            "data": {
+                "attributes": attrs
             }
         }
 
 
 class PointsMaterial(Material):
-    def __init__(self, size=0.001, color=0xffffff):
-        super(PointsMaterial, self).__init__()
+    def __init__(self, size: float = 0.001, color: int = 0xffffff):
+        super().__init__()
         self.size = size
         self.color = color
 
     def lower(self, object_data):
         return {
-            u"uuid": self.uuid,
-            u"type": u"PointsMaterial",
-            u"color": self.color,
-            u"size": self.size,
-            u"vertexColors": 2
+            "uuid": self.uuid,
+            "type": "PointsMaterial",
+            "color": self.color,
+            "size": self.size,
+            "vertexColors": 2
         }
 
 
 class Points(Object):
-    _type = u"Points"
+    _type = "Points"
 
 
-def PointCloud(position, color, **kwargs):
+def PointCloud(position: np.ndarray, color: np.ndarray, **kwargs):
     return Points(
         PointsGeometry(position, color),
         PointsMaterial(**kwargs)
@@ -598,15 +615,15 @@ def SceneText(text, width=10, height=10, **kwargs):
         )
 
 class Line(Object):
-    _type = u"Line"
+    _type = "Line"
 
 
 class LineSegments(Object):
-    _type = u"LineSegments"
+    _type = "LineSegments"
 
 
 class LineLoop(Object):
-    _type = u"LineLoop"
+    _type = "LineLoop"
 
 
 def triad(scale=1.0):

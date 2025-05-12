@@ -24,40 +24,62 @@
 
 # Based on https://github.com/ilkerkesen/tornado-websocket-client-example
 
-from __future__ import absolute_import, division, print_function
-import argparse
-
-from tornado.ioloop import IOLoop, PeriodicCallback
-from tornado import gen
-from tornado.websocket import websocket_connect
-
+import asyncio
+import rich_click as click
+import websockets
 
 class Client(object):
-    def __init__(self, url, timeout):
+    def __init__(self, url, timeout, port):
         self.url = url
         self.timeout = timeout
-        self.ioloop = IOLoop.instance()
+        self.port = port
         self.ws = None
-        self.connect()
-        self.ioloop.start()
-
-    @gen.coroutine
-    def connect(self):
-        self.ws = yield websocket_connect(self.url)
-        self.run()
-
-    @gen.coroutine
-    def run(self):
-        while True:
-            msg = yield self.ws.read_message()
-            if msg is None:
-                self.ws = None
-                break
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument("port", type=int)
-    result = parser.parse_args()
-    url = "ws://localhost:{:d}".format(result.port)
-    client = Client(url, 5)
+    async def connect(self):
+        try:
+            # Connect to the WebSocket server
+            self.ws = await websockets.connect(self.url, open_timeout=self.timeout)
+            print(f"Connected to {self.url}")
+            await self.run() # Call run after successful connection
+        except Exception as e:
+            print(f"Connection failed: {e}")
+            self.ws = None
+
+
+    async def run(self):
+        if not self.ws:
+            print("WebSocket connection not established.")
+            return
+        try:
+            while True:
+                # Receive messages from the server
+                msg = await self.ws.recv()
+                if msg is None: # Connection closed by server
+                    print("Connection closed by server.")
+                    break
+                print(f"Received message: {msg}")
+                # Add message handling logic here if needed
+        except websockets.exceptions.ConnectionClosed:
+            print("Connection closed unexpectedly.")
+        except Exception as e:
+            print(f"An error occurred: {e}")
+        finally:
+            if self.ws:
+                await self.ws.close()
+            self.ws = None
+
+
+
+@click.command()
+@click.argument("port", type=int)  # Accept positional port argument
+def main(port):
+    url = f"ws://localhost:{port}" # Use f-string
+    client = Client(url, 5, port)
+    try:
+        asyncio.run(client.connect())
+    except KeyboardInterrupt:
+        print("Client stopped by user.")
+
+if __name__ == "__main__":
+    main()

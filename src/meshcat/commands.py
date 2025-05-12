@@ -1,6 +1,7 @@
+from meshcat.animation import Animation
 from .geometry import Geometry, Object, Mesh, MeshPhongMaterial, OrthographicCamera, PerspectiveCamera, PointsMaterial, Points, TextTexture
 from .path import Path
-
+from typing import Any
 
 class SetObject:
     __slots__ = ["object", "path"]
@@ -25,9 +26,9 @@ class SetObject:
 
     def lower(self):
         return {
-            u"type": u"set_object",
-            u"object": self.object.lower(),
-            u"path": self.path.lower()
+            "type": "set_object",
+            "object": self.object.lower(),
+            "path": self.path.lower()
         }
 
 
@@ -61,18 +62,18 @@ class SetCamTarget:
 
 class CaptureImage:
 
-    def __init__(self, xres=None, yres=None):
+    def __init__(self, xres: int | None = None, yres: int | None = None):
         self.xres = xres
         self.yres = yres
 
-    def lower(self):
-        data = {
-            u"type": u"capture_image"
+    def lower(self) -> dict[str, int|str]:
+        data: dict[str, int|str] = {
+            "type": "capture_image"
         }
         if self.xres:
-            data[u"xres"] = self.xres
+            data["xres"] = self.xres
         if self.yres:
-            data[u"yres"] = self.yres
+            data["yres"] = self.yres
         return data
 
 
@@ -83,40 +84,40 @@ class Delete:
 
     def lower(self):
         return {
-            u"type": u"delete",
-            u"path": self.path.lower()
+            "type": "delete",
+            "path": self.path.lower()
         }
 
 class SetProperty:
     __slots__ = ["path", "key", "value"]
-    def __init__(self, key, value, path):
+    def __init__(self, key: str, value: Any, path: str):
         self.key = key
         self.value = value
         self.path = path
 
     def lower(self):
         return {
-            u"type": u"set_property",
-            u"path": self.path.lower(),
-            u"property": self.key.lower(),
-            u"value": self.value
+            "type": "set_property",
+            "path": self.path.lower(),
+            "property": self.key.lower(),
+            "value": self.value
         }
 
 class SetAnimation:
     __slots__ = ["animation", "play", "repetitions"]
 
-    def __init__(self, animation, play=True, repetitions=1):
+    def __init__(self, animation: "Animation", play: bool = True, repetitions: int = 1):
         self.animation = animation
         self.play = play
         self.repetitions = repetitions
 
     def lower(self):
         return {
-            u"type": u"set_animation",
-            u"animations": self.animation.lower(),
-            u"options": {
-                u"play": self.play,
-                u"repetitions": self.repetitions
+            "type": "set_animation",
+            "animations": self.animation.lower(),
+            "options": {
+                "play": self.play,
+                "repetitions": self.repetitions
             },
-            u"path": ""
+            "path": ""
         }
